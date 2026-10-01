@@ -1,0 +1,20 @@
+import { env } from "cloudflare:workers";
+import { drop } from "@/lib/game";
+type State={board:number[];names:string[];tokens:string[];turn:number;winner:number;line:number[];round:number;votes:number[]};
+function db(){if(!env.DB)throw Error("Game service unavailable");return env.DB.withSession("first-primary")}
+function reply(data:unknown,status=200){return Response.json(data,{status,headers:{"Cache-Control":"no-store"}})}
+function view(code:string,s:State,revision:number,token:string){const {tokens,...rest}=s;return{code,...rest,revision,me:tokens.indexOf(token)+1}}
+export async function GET(req:Request){try{const p=new URL(req.url).searchParams,code=p.get("code")||"",token=p.get("token")||"";const r=await db().prepare("SELECT state, revision FROM rooms WHERE code = ?").bind(code).first<{state:string;revision:number}>();if(!r)return reply({error:"Room not found."},404);const s:State=JSON.parse(r.state);if(!s.tokens.includes(token))return reply({error:"Join this room first."},403);return reply(view(code,s,r.revision,token))}catch(e){console.error(e);return reply({error:"Game service is unavailable. Please retry."},503)}}
+export async function POST(req:Request){try{
+if(req.headers.get("origin")&&req.headers.get("origin")!==new URL(req.url).origin)return reply({error:"Invalid origin."},403);
+const body=await req.text();if(body.length>2048)return reply({error:"Request too large."},413);let b;try{b=JSON.parse(body)}catch{return reply({error:"Invalid request."},400)}if(!b||typeof b!=="object")return reply({error:"Invalid request."},400);
+const {action,token}=b;if(typeof token!=="string"||!/^[a-f0-9-]{36}$/.test(token))return reply({error:"Please reload to reconnect."},400);
+const conn=db();let code=typeof b.code==="string"?b.code.toUpperCase():"";const name=typeof b.name==="string"?b.name.trim().slice(0,24):"";
+if(action==="create"){if(!name)return reply({error:"Enter your name first."},400);const s:State={board:Array(42).fill(0),names:[name],tokens:[token],turn:1,winner:0,line:[],round:1,votes:[]};
+for(let i=0;i<5;i++){code=Array.from(crypto.getRandomValues(new Uint8Array(6)),n=>"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[n%32]).join("");const result=await conn.prepare("INSERT OR IGNORE INTO rooms (code,state,revision) VALUES (?,?,0)").bind(code,JSON.stringify(s)).run();if(result.meta.changes)return reply(view(code,s,0,token))}return reply({error:"Could not create a room. Try again."},503)}
+if(!/^[A-Z0-9]{6}$/.test(code))return reply({error:"Enter a six-character room code."},400);
+const r=await conn.prepare("SELECT state, revision FROM rooms WHERE code = ?").bind(code).first<{state:string;revision:number}>();if(!r)return reply({error:"We couldn’t find that room. Check the code."},404);const s:State=JSON.parse(r.state),me=s.tokens.indexOf(token)+1;
+if(action==="join"){if(me)return reply(view(code,s,r.revision,token));if(!name)return reply({error:"Enter your name first."},400);if(s.tokens.length===2)return reply({error:"This table already has two players."},409);s.tokens.push(token);s.names.push(name)}
+else{if(!me)return reply({error:"Join the room before playing."},403);if(action==="move"){if(s.tokens.length<2)return reply({error:"Wait for your friend to join."},409);if(s.winner||s.turn!==me)return reply({error:"It isn’t your turn."},409);try{Object.assign(s,drop(s.board,b.column,me));s.turn=3-me}catch(e){return reply({error:(e as Error).message},400)}}else if(action==="rematch"){if(!s.winner)return reply({error:"Finish this round first."},409);if(!s.votes.includes(me))s.votes.push(me);if(s.votes.length===2){s.board=Array(42).fill(0);s.winner=0;s.line=[];s.votes=[];s.round++;s.turn=s.round%2===0?2:1}}else return reply({error:"Unknown action."},400)}
+const result=await conn.prepare("UPDATE rooms SET state = ?, revision = revision + 1 WHERE code = ? AND revision = ?").bind(JSON.stringify(s),code,r.revision).run();if(!result.meta.changes)return reply({error:"The game just changed. Please try again."},409);return reply(view(code,s,r.revision+1,token))
+}catch(e){console.error(e);return reply({error:"Game service is unavailable. Please retry."},503)}}
